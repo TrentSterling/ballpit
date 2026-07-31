@@ -1,0 +1,8 @@
+shots/*.png
+!shots/dam-break.png
+!shots/fall.png
+!shots/river.png
+!shots/swirl.png
+!shots/pegs.png
+!shots/shove.png
+node_modules/

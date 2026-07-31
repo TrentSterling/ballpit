@@ -1,0 +1,79 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>BALLPIT - GPU contact physics testbed</title>
+<link rel="icon" href="data:,">
+<script type="importmap">
+{
+  "imports": {
+    "three/webgpu": "./vendor/three.webgpu.js",
+    "three/tsl": "./vendor/three.tsl.js"
+  }
+}
+</script>
+<style>
+  * { box-sizing: border-box; }
+  html, body { margin: 0; height: 100%; overflow: hidden; background: #0b0f14; color: #dce6f2;
+    font: 13px/1.45 Consolas, "DejaVu Sans Mono", monospace; }
+  canvas { display: block; }
+
+  #panel {
+    position: fixed; top: 10px; left: 10px; width: 260px; padding: 12px 14px;
+    background: rgba(10,16,24,0.88); border: 1px solid #26374a;
+  }
+  #panel h1 { margin: 0 0 2px; font-size: 15px; letter-spacing: 3px; font-weight: normal; color: #7ee0ff; }
+  #panel .sub { color: #7d90a6; font-size: 10px; margin-bottom: 10px; }
+  .stat { display: flex; justify-content: space-between; }
+  .stat span:last-child { color: #7ee0ff; }
+  .fps { font-size: 22px; color: #8fdc5a; line-height: 1.2; }
+  .row { display: grid; grid-template-columns: 92px 1fr 44px; gap: 6px; align-items: center; margin-top: 5px; }
+  .row label { color: #7d90a6; font-size: 11px; }
+  .row output { color: #7ee0ff; font-size: 11px; text-align: right; }
+  input[type=range] { width: 100%; accent-color: #7ee0ff; }
+  hr { border: 0; border-top: 1px solid #26374a; margin: 10px 0; }
+  button { width: 100%; margin-top: 6px; padding: 5px; font: inherit; cursor: pointer;
+    background: #16222f; color: #dce6f2; border: 1px solid #26374a; }
+  button:hover { border-color: #7ee0ff; }
+  #help { position: fixed; bottom: 10px; left: 50%; transform: translateX(-50%);
+    color: #7d90a6; font-size: 11px; }
+  #boot { position: fixed; inset: 0; display: grid; place-content: center; text-align: center; }
+  /* display:grid beats the [hidden] attribute, so say it explicitly */
+  #boot[hidden] { display: none; }
+</style>
+</head>
+<body>
+<div id="boot">
+  <h1>BALLPIT</h1>
+  <p id="bootmsg">starting WebGPU&hellip;</p>
+</div>
+
+<div id="panel" hidden>
+  <h1>BALLPIT</h1>
+  <div class="sub">GPU contact physics testbed</div>
+  <div class="fps"><span id="fps">--</span> fps</div>
+  <div class="stat"><span>frame</span><span id="ms">--</span></div>
+  <div class="stat"><span>compute</span><span id="compute">--</span></div>
+  <div class="stat"><span>particles</span><span id="count">--</span></div>
+  <div class="stat"><span>area fill</span><span id="fill">--</span></div>
+  <div class="stat"><span>overlap</span><span id="overlap">--</span></div>
+  <div class="stat"><span>speed capped</span><span id="capped">--</span></div>
+  <div class="stat"><span>hash dropped</span><span id="dropped">--</span></div>
+  <hr>
+  <div class="row"><label>radius</label><input id="s-radius" type="range"><output id="o-radius"></output></div>
+  <div class="row"><label>stiffness</label><input id="s-stiff" type="range" min="0.2" max="1.6" step="0.05"><output id="o-stiff"></output></div>
+  <div class="row"><label>viscosity</label><input id="s-visc" type="range" min="0" max="0.6" step="0.01"><output id="o-visc"></output></div>
+  <div class="row"><label>substeps</label><input id="s-subs" type="range" min="1" max="24" step="1"><output id="o-subs"></output></div>
+  <div class="row"><label>iterations</label><input id="s-iters" type="range" min="1" max="8" step="1"><output id="o-iters"></output></div>
+  <div class="row"><label>gravity</label><input id="s-grav" type="range" min="0" max="60" step="1"><output id="o-grav"></output></div>
+  <div class="row"><label>flow</label><input id="s-flow" type="range" min="0" max="24" step="1"><output id="o-flow"></output></div>
+  <button id="reset">RESET (R)</button>
+  <button id="modeBtn">MODE: DAM BREAK (space)</button>
+</div>
+
+<div id="help" hidden>left-drag push &middot; right-drag pull &middot; wheel resize &middot; R reset &middot; SPACE mode &middot; P pause</div>
+
+<script type="module" src="./src/sim.js"></script>
+</body>
+</html>
