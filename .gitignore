@@ -5,4 +5,6 @@ shots/*.png
 !shots/swirl.png
 !shots/pegs.png
 !shots/shove.png
+!shots/map.png
 node_modules/
+shots/archive/

@@ -32,9 +32,16 @@
 // The correction goes to its own buffer and is applied in a second pass.
 
 import * as THREE from 'three/webgpu';
+// NOTE a trap that cost a debugging session: replacing the unrolled
+// K-slot bucket scans with runtime count-bounded Loops (atomicLoad the cell
+// count, loop to it) LOOKED like a clean 3x speedup and compiled fine, but the
+// gathers came back near-empty: XSPH viscosity went inert and the sim ran 3x
+// hot with jittering piles, while non-penetration still mostly held. If the
+// bucket loops ever get optimised again, verify with the SWIRL mean-speed and
+// FALL drift numbers, not with the breach counts.
 import {
-  Fn, If, Return, instancedArray, uniform, atomicAdd, atomicStore, instanceIndex,
-  float, int, uint, vec2, vec3, vec4, length, max, clamp,
+  Fn, If, Loop, Return, instancedArray, uniform, uniformArray, atomicAdd, atomicStore, instanceIndex,
+  float, int, uint, vec2, vec3, vec4, length, max, clamp, abs,
   hash, positionGeometry, uv, mix, step, smoothstep, cos, sin,
 } from 'three/tsl';
 
@@ -51,19 +58,82 @@ const WORLD_H = 22;
 // available area, which no solver can satisfy and which looks exactly like the
 // flat pancake it is.
 const FILL = 0.25;
-const AUTO_R = Math.sqrt((FILL * WORLD_W * WORLD_H) / (Math.PI * COUNT));
-const R_MIN = AUTO_R * 0.5;
-const R_MAX = AUTO_R * 1.5;
 
-// The hash grid is allocated for the smallest radius the slider allows, then
-// simply uses fewer of its cells when the radius goes up.
-const CELL_MIN = R_MIN * 2.05;
+// THREE SIZE CLASSES, assigned by index range so every run and every probe sees
+// the same population: a crowd of smalls and larges (a horde's runners and
+// brutes) plus a few giants at the END of the index range, where "is this a
+// giant" is an index compare instead of a lookup. ?giants=N scales the battle.
+//
+// Mass follows area, and that is the entire mass model: a giant carries
+// (3.5/0.85)^2 ~ 17x the mass of a small, and the existing inverse-mass share
+// in the contact solve does everything else.
+// No cap beyond the head count: an all-giant pit is just the uniform sim living
+// in the coarse grid. The one honest caveat is allocation: both grids are sized
+// at BOOT for the boot-time class mix, so cranking the slider far above the
+// boot count shrinks everyone under grids sized for bigger balls, and the fine
+// buckets start dropping neighbours (counted, shown as hash dropped). For a
+// real mega-battle, boot with ?n=...&giants=... so the grids are sized for it.
+const GIANTS_MAX = COUNT;
+const GIANTS0 = Math.min(qs.has('giants') ? Math.max(0, Number(qs.get('giants')) || 0) : 12, GIANTS_MAX);
+const M_SMALL = 0.85;
+const M_LARGE = 1.2;
+const M_GIANT = 3.5;
+
+// Giant count is LIVE (a slider), which only works because giants are ordinary
+// particles: the class boundaries are uniforms compared against the index, so
+// changing the count is a reset, not a reallocation.
+const areaMult = (g) => {
+  const crowd = COUNT - g;
+  const ns = Math.round(crowd * 0.65);
+  return ns * M_SMALL ** 2 + (crowd - ns) * M_LARGE ** 2 + g * M_GIANT ** 2;
+};
+
+// The base radius solves the same fill equation, but against the summed area of
+// all three classes at the BOOT giant count; when the slider moves, a global
+// scale compensation in setRadius holds the fill steady, so 1000 giants shrink
+// everyone instead of overstuffing the pit.
+const AREA_MULT0 = areaMult(GIANTS0);
+const BASE_R = Math.sqrt((FILL * WORLD_W * WORLD_H) / (Math.PI * AREA_MULT0));
+const R_MIN = BASE_R * 0.5;
+const R_MAX = BASE_R * 1.5;
+
+// TWO HASH GRIDS, one per tier: this is the whole variable-radius strategy. A
+// single grid has to size its cells for the biggest body in it, which taxes
+// every small ball with giant-sized cells forever; multi-cell scatter avoids
+// that but buys duplicate contacts and variable-length scatter loops. Instead
+// the crowd gets a fine grid and the giants a coarse one, every particle
+// scatters into exactly ONE of them (so no pair can ever be found twice), and
+// all four pair types are still discovered:
+//
+//   crowd - crowd   fine grid, 3x3        exactly the uniform-radius case
+//   crowd - giant   coarse grid, 3x3      one coarse cell out-reaches the pair
+//   giant - crowd   fine grid, 5x5        GIANT_WIN below
+//   giant - giant   coarse grid, 3x3
+//
+// A giant pays a wider scan, which is fair: it genuinely touches that many
+// more neighbours. A thousand giants scanning 5x5 cost about what the crowd
+// costs scanning 3x3, so a full giant battle scales.
+//
+// Both grids are allocated for the smallest radius the slider allows, then
+// simply use fewer of their cells when the radius goes up.
+const CELL_MIN = M_LARGE * R_MIN * 2.05;    // fine cell covers the largest crowd pair
 const GRID_W_MAX = Math.ceil(WORLD_W / CELL_MIN) + 1;
 const GRID_H_MAX = Math.ceil(WORLD_H / CELL_MIN) + 1;
 const GRID_MAX = GRID_W_MAX * GRID_H_MAX;
-const BUCKET_K = 12;                // neighbours tracked per cell
+const BUCKET_K = 16;                // neighbours tracked per fine cell
 
-const MODES = ['DAM BREAK', 'FALL', 'RIVER', 'SWIRL', 'PEGS', 'SHOVE'];
+const CCELL_MIN = M_GIANT * R_MIN * 2.05;
+const CGRID_W_MAX = Math.ceil(WORLD_W / CCELL_MIN) + 1;
+const CGRID_H_MAX = Math.ceil(WORLD_H / CCELL_MIN) + 1;
+const CGRID_MAX = CGRID_W_MAX * CGRID_H_MAX;
+const CBUCKET_K = 12;               // few giants fit in a giant-sized cell
+
+// How many fine cells a giant must look out to cover its own contact reach:
+// W * cell >= r_giant + r_large. The cell scales with the same slider the radii
+// do, so the ratio is constant: ceil((3.5 + 1.2) / (1.2 * 2.05)) = 2.
+const GIANT_WIN = Math.ceil((M_GIANT + M_LARGE) / (M_LARGE * 2.05));
+
+const MODES = ['DAM BREAK', 'FALL', 'RIVER', 'SWIRL', 'PEGS', 'SHOVE', 'MAP'];
 
 const boot = document.getElementById('boot');
 const bootmsg = document.getElementById('bootmsg');
@@ -95,10 +165,12 @@ const prev = instancedArray(COUNT, 'vec2');     // position at the start of the 
 const corr = instancedArray(COUNT, 'vec4');     // dx, dy, contacts, spare
 const cellCount = instancedArray(GRID_MAX, 'uint').toAtomic();
 const bucket = instancedArray(GRID_MAX * BUCKET_K, 'uint');
+const ccellCount = instancedArray(CGRID_MAX, 'uint').toAtomic();      // giants only
+const cbucket = instancedArray(CGRID_MAX * CBUCKET_K, 'uint');
 // 0: summed deepest overlap (thousandths)  1: contacting particles
 // 2: particles hitting the speed limit     3: neighbours the hash had to drop
 const stats = instancedArray(4, 'uint').toAtomic();
-// inverse mass, heavy flag, spawn time, spare
+// inverse mass, class (0 small / 1 large / 2 giant), spawn time, base radius
 const meta = instancedArray(COUNT, 'vec4');
 // Static round obstacles: x, y, radius, spare. Laid out by a compute pass rather
 // than uploaded, so there is no CPU write path to get wrong.
@@ -106,11 +178,17 @@ const PEG_COLS = 6;
 const PEG_ROWS = 4;
 const PEG_COUNT = PEG_COLS * PEG_ROWS;
 const pegs = instancedArray(PEG_COUNT, 'vec4');
+// Solid rectangles balls cannot enter: cx, cy, half-width, half-height. Set from
+// the CPU through a uniform array and copied into storage by a tiny compute
+// pass, so the solver and the renderer still read the exact same buffer.
+const MAX_BOXES = 16;
+const boxSrc = uniformArray(Array.from({ length: MAX_BOXES }, () => new THREE.Vector4()));
+const boxes = instancedArray(MAX_BOXES, 'vec4');
 
 const u = {
   h: uniform(1 / 120),              // substep length
   time: uniform(0),
-  radius: uniform(AUTO_R),
+  rScale: uniform(1),               // slider scale on every per-particle base radius
   stiffness: uniform(1.0),          // share of the averaged correction applied
   viscosity: uniform(0.08),         // XSPH: how much neighbourhood velocity to adopt
   travel: uniform(0.9),             // max travel per substep, in radii
@@ -118,14 +196,22 @@ const u = {
   flow: uniform(9),
   mode: uniform(0, 'int'),
   pegsOn: uniform(0),
+  boxCount: uniform(0, 'int'),
   cell: uniform(CELL_MIN),
   gridW: uniform(GRID_W_MAX, 'int'),
   gridWf: uniform(GRID_W_MAX),
   gridHf: uniform(GRID_H_MAX),
+  ccell: uniform(CCELL_MIN),
+  cgridW: uniform(CGRID_W_MAX, 'int'),
+  cgridWf: uniform(CGRID_W_MAX),
+  cgridHf: uniform(CGRID_H_MAX),
   pointer: uniform(new THREE.Vector2(-999, -999)),
   pointerPush: uniform(0),
   pointerRadius: uniform(5),
   seed: uniform(1, 'int'),
+  // class boundaries: index >= smallN is large, index >= crowdN is giant
+  smallN: uniform(Math.round((COUNT - GIANTS0) * 0.65), 'uint'),
+  crowdN: uniform(COUNT - GIANTS0, 'uint'),
 };
 
 const SPOUT = [WORLD_W * 0.5, WORLD_H * 0.95];
@@ -144,6 +230,13 @@ const pegPass = Fn(() => {
   pegs.element(k).assign(vec4(x, y, 0.85, 0));
 })().compute(PEG_COUNT);
 
+// Rectangles come from the CPU (they are level design, not procedure), but go
+// through this copy pass rather than a raw buffer upload: uniforms are the one
+// CPU write path this file already trusts.
+const boxUploadPass = Fn(() => {
+  boxes.element(instanceIndex).assign(boxSrc.element(instanceIndex));
+})().compute(MAX_BOXES);
+
 // ----------------------------------------------------------------- init pass
 // Each mode starts from the block that makes its behaviour legible. DAM BREAK is
 // the standard fluid validation case: a column held against one wall, then
@@ -154,10 +247,12 @@ const initPass = Fn(() => {
   const rx = hash(i.add(uint(u.seed))).toVar();
   const ry = hash(i.add(uint(u.seed)).add(uint(9871))).toVar();
   const p = vec2(0).toVar();
-  // inverse mass. 1 is the light default; a heavy particle gets a smaller one
-  // and therefore wins position disputes against its lighter neighbours.
-  const invMass = float(1).toVar();
-  const heavy = float(0).toVar();
+  // Class and radius from the index range; positions come from hash(i), so the
+  // classes are spatially mixed even though the indices are contiguous.
+  const cls = float(0).toVar();
+  const mult = float(M_SMALL).toVar();
+  If(i.greaterThanEqual(u.smallN), () => { cls.assign(1); mult.assign(M_LARGE); });
+  If(i.greaterThanEqual(u.crowdN), () => { cls.assign(2); mult.assign(M_GIANT); });
   const spawn = float(-1).toVar();                     // already awake
 
   If(u.mode.equal(int(0)), () => {                     // dam: tall column, left wall
@@ -182,22 +277,28 @@ const initPass = Fn(() => {
             ));
             spawn.assign(float(i).div(COUNT).mul(POUR_SECONDS));
           }).Else(() => {
-            // SHOVE: a mixed crowd driven sideways. The heavy quarter should
-            // plough to the front of the pack and hold it.
-            //
-            // This mode started life as a buoyancy test and that test FAILED,
-            // for a reason worth keeping: non-penetration constraints plus
-            // gravity-as-acceleration are weightless. A heavy particle never
-            // presses down harder, it only resists being pushed, so a dense
-            // layer resting on a light one has no reason at all to sink. Real
-            // buoyancy needs a density constraint (position based FLUIDS), which
-            // is a different solver, not a tweak to this one.
-            //
-            // What inverse mass genuinely buys is who wins a contact, so that is
-            // what gets tested. It is also the only part a crowd game needs.
-            p.assign(vec2(rx.mul(WORLD_W * 0.55).add(0.4), ry.mul(WORLD_H * 0.55).add(0.3)));
-            heavy.assign(step(float(0.75), hash(i.add(uint(4242)))));
-            invMass.assign(mix(float(1), float(0.2), heavy));
+            If(u.mode.equal(int(6)), () => {
+              // MAP: a slab dropped onto the rectangle layout. Spawns strictly
+              // above the highest shelf so nobody starts inside a box.
+              p.assign(vec2(rx.mul(WORLD_W * 0.9).add(0.5), ry.mul(WORLD_H * 0.24).add(WORLD_H * 0.72)));
+            }).Else(() => {
+              // SHOVE: a mixed crowd driven sideways. The size classes ARE the
+              // mixed masses now: a large ball carries ~2x the mass of a small
+              // and the giants 17x, so this mode tests what the whole file's
+              // mass model buys.
+              //
+              // This mode started life as a buoyancy test and that test FAILED,
+              // for a reason worth keeping: non-penetration constraints plus
+              // gravity-as-acceleration are weightless. A heavy particle never
+              // presses down harder, it only resists being pushed, so a dense
+              // layer resting on a light one has no reason at all to sink. Real
+              // buoyancy needs a density constraint (position based FLUIDS), which
+              // is a different solver, not a tweak to this one.
+              //
+              // What inverse mass genuinely buys is who wins a contact, so that is
+              // what gets tested. It is also the only part a crowd game needs.
+              p.assign(vec2(rx.mul(WORLD_W * 0.55).add(0.4), ry.mul(WORLD_H * 0.55).add(0.3)));
+            });
           });
         });
       });
@@ -207,12 +308,18 @@ const initPass = Fn(() => {
   pos.element(i).assign(vec4(p, 0, 0));
   prev.element(i).assign(p);
   corr.element(i).assign(vec4(0));
-  meta.element(i).assign(vec4(invMass, heavy, spawn, 0));
+  // mass follows area: invMass = 1 / mult^2
+  meta.element(i).assign(vec4(float(1).div(mult.mul(mult)), cls, spawn, mult.mul(BASE_R)));
 })().compute(COUNT);
 
 // ---------------------------------------------------------------- clear pass
 const clearPass = Fn(() => {
   atomicStore(cellCount.element(instanceIndex), uint(0));
+  // The coarse grid is always smaller than the fine one (its cells are bigger),
+  // so it rides along in the same dispatch.
+  If(instanceIndex.lessThan(uint(CGRID_MAX)), () => {
+    atomicStore(ccellCount.element(instanceIndex), uint(0));
+  });
   If(instanceIndex.lessThan(uint(4)), () => {
     atomicStore(stats.element(instanceIndex), uint(0));
   });
@@ -222,6 +329,7 @@ const clearPass = Fn(() => {
 // The only place steering is allowed to speak, and it speaks in accelerations.
 const predictPass = Fn(() => {
   const i = instanceIndex;
+  const mi = meta.element(i).toVar();
   const P = pos.element(i).toVar();
   const p = P.xy.toVar();
   const v = P.zw.toVar();
@@ -231,7 +339,7 @@ const predictPass = Fn(() => {
   // Return() is the TSL node, not a JavaScript return: a bare `return` here
   // would just end the callback and emit no shader code at all, so every
   // unspawned particle would carry on simulating.
-  If(meta.element(i).z.greaterThan(u.time), () => {
+  If(mi.z.greaterThan(u.time), () => {
     prev.element(i).assign(p);
     Return();
   });
@@ -269,17 +377,20 @@ const predictPass = Fn(() => {
   v.addAssign(a.mul(u.h));
 
   // THE DISCRETISATION SPEED LIMIT.
-  // A particle may not travel further than about one radius in a substep. Go
-  // past that and it steps clean through the layer beneath it before the solver
-  // has ever seen the contact: the pile it should be landing on is simply not
-  // there yet when its position is written. That is what turns a ball pit into
-  // a pancake, and no amount of solver iterations can undo it afterwards,
-  // because once everything is coincident the hash overflows too.
+  // A particle may not travel further than about one OWN radius in a substep.
+  // Go past that and it steps clean through the layer beneath it before the
+  // solver has ever seen the contact: the pile it should be landing on is
+  // simply not there yet when its position is written. That is what turns a
+  // ball pit into a pancake, and no amount of solver iterations can undo it
+  // afterwards, because once everything is coincident the hash overflows too.
+  //
+  // Per-particle: a giant's cap is proportionally higher, and it still cannot
+  // skip a crowd ball, because 0.9 * r_giant < r_giant + r_small.
   //
   // The cap is a symptom gauge as much as a fix. If stats[2] is large the
   // substep count is too low for the gravity in use; raise substeps until it
   // falls to zero and the cap stops mattering.
-  const vmax = u.radius.mul(u.travel).div(u.h).toVar();
+  const vmax = mi.w.mul(u.rScale).mul(u.travel).div(u.h).toVar();
   const sp = length(v).toVar();
   If(sp.greaterThan(vmax), () => {
     v.mulAssign(vmax.div(sp));
@@ -293,26 +404,45 @@ const predictPass = Fn(() => {
 
 // -------------------------------------------------------------- scatter pass
 const scatterPass = Fn(() => {
-  If(meta.element(instanceIndex).z.greaterThan(u.time), () => { Return(); });
+  const mi = meta.element(instanceIndex).toVar();
+  If(mi.z.greaterThan(u.time), () => { Return(); });
   const p = pos.element(instanceIndex).xy.toVar();
-  const cx = int(clamp(p.x.div(u.cell), float(0), u.gridWf.sub(1))).toVar();
-  const cy = int(clamp(p.y.div(u.cell), float(0), u.gridHf.sub(1))).toVar();
-  const cell = cy.mul(u.gridW).add(cx).toVar();
-  const slot = atomicAdd(cellCount.element(cell), uint(1)).toVar();
-  If(slot.lessThan(uint(BUCKET_K)), () => {
-    // index + 1, so an untouched slot reads as empty
-    bucket.element(cell.mul(int(BUCKET_K)).add(int(slot))).assign(instanceIndex.add(uint(1)));
+  // Exactly ONE grid per particle, chosen by class. The other tier finds it
+  // there; nothing is ever listed twice, so no contact can be double-counted.
+  If(mi.y.greaterThan(float(1.5)), () => {
+    const cx = int(clamp(p.x.div(u.ccell), float(0), u.cgridWf.sub(1))).toVar();
+    const cy = int(clamp(p.y.div(u.ccell), float(0), u.cgridHf.sub(1))).toVar();
+    const cell = cy.mul(u.cgridW).add(cx).toVar();
+    const slot = atomicAdd(ccellCount.element(cell), uint(1)).toVar();
+    If(slot.lessThan(uint(CBUCKET_K)), () => {
+      cbucket.element(cell.mul(int(CBUCKET_K)).add(int(slot))).assign(instanceIndex.add(uint(1)));
+    }).Else(() => {
+      atomicAdd(stats.element(uint(3)), uint(1));
+    });
   }).Else(() => {
-    // Anything past BUCKET_K is invisible to every neighbour for this substep.
-    // A silent drop here is indistinguishable from good physics right up until
-    // the crowd interpenetrates, so it gets counted and shown.
-    atomicAdd(stats.element(uint(3)), uint(1));
+    const cx = int(clamp(p.x.div(u.cell), float(0), u.gridWf.sub(1))).toVar();
+    const cy = int(clamp(p.y.div(u.cell), float(0), u.gridHf.sub(1))).toVar();
+    const cell = cy.mul(u.gridW).add(cx).toVar();
+    const slot = atomicAdd(cellCount.element(cell), uint(1)).toVar();
+    If(slot.lessThan(uint(BUCKET_K)), () => {
+      // index + 1, so an untouched slot reads as empty
+      bucket.element(cell.mul(int(BUCKET_K)).add(int(slot))).assign(instanceIndex.add(uint(1)));
+    }).Else(() => {
+      // Anything past BUCKET_K is invisible to every neighbour for this substep.
+      // A silent drop here is indistinguishable from good physics right up until
+      // the crowd interpenetrates, so it gets counted and shown.
+      atomicAdd(stats.element(uint(3)), uint(1));
+    });
   });
 })().compute(COUNT);
 
 // ---------------------------------------------------------------- relax pass
 // Gathers the non-penetration corrections. Writes nowhere but its own slot, so
 // every particle in an iteration sees the exact same world: a true Jacobi sweep.
+//
+// Every particle reads BOTH grids: the fine one for crowd neighbours, the
+// coarse one for giants. Each particle was scattered into exactly one grid, so
+// no pair is ever found twice and the averaged correction stays unbiased.
 const relaxPass = Fn(() => {
   const i = instanceIndex;
   const mi = meta.element(i).toVar();
@@ -322,50 +452,79 @@ const relaxPass = Fn(() => {
   });
   const p = pos.element(i).xy.toVar();
   const wi = mi.x.toVar();                      // inverse mass
-  const r = u.radius.toVar();
-  const minDist = r.mul(2).toVar();
+  const ri = mi.w.mul(u.rScale).toVar();        // own radius
 
   const push = vec2(0).toVar();
   const hits = float(0).toVar();
   const deepest = float(0).toVar();
 
-  const cx = int(clamp(p.x.div(u.cell), float(1), u.gridWf.sub(2))).toVar();
-  const cy = int(clamp(p.y.div(u.cell), float(1), u.gridHf.sub(2))).toVar();
+  // The contact test, identical for every pair type; only where the candidate
+  // came from differs.
+  const visit = (other) => {
+    If(other.notEqual(i), () => {
+      const q = pos.element(other).xy.toVar();
+      const mo = meta.element(other).toVar();
+      const minDist = ri.add(mo.w.mul(u.rScale)).toVar();
+      const delta = p.sub(q).toVar();
+      const dist = length(delta).toVar();
+      If(dist.lessThan(minDist), () => {
+        // Coincident pairs give a garbage normal. Fall back to a stable
+        // per-pair direction rather than to noise, so the pair actually
+        // separates instead of jittering in place.
+        const degenerate = step(dist, float(1e-5));
+        const ang = hash(i.add(other).add(uint(7331))).mul(6.2831853).toVar();
+        const jitter = vec2(cos(ang), sin(ang));
+        const n = mix(delta.div(max(dist, float(1e-5))), jitter, degenerate).toVar();
+        const overlap = minDist.sub(dist).toVar();
+        // Split the overlap by inverse mass instead of evenly. Equal
+        // masses give half each, exactly as before; a heavy particle
+        // yields less and so shoves lighter ones aside. With mass following
+        // area, a giant takes ~1/18th of a giant-small correction: it ploughs.
+        //
+        // This is the only mass term in the file, and buoyancy falls out
+        // of it: there is no buoyancy force anywhere, the dense phase
+        // simply wins its contacts and sinks.
+        const share = wi.div(max(wi.add(mo.x), float(1e-5))).toVar();
+        push.addAssign(n.mul(overlap.mul(share)));
+        hits.addAssign(1);
+        deepest.assign(max(deepest, overlap));
+      });
+    });
+  };
 
-  for (let oy = -1; oy <= 1; oy++) {
-    for (let ox = -1; ox <= 1; ox++) {
-      const cell = cy.add(int(oy)).mul(u.gridW).add(cx.add(int(ox))).toVar();
+  // FINE GRID. The crowd looks one cell out, exactly as it always has. A
+  // giant's contact reach spans more fine cells than its body sits in, so it
+  // looks GIANT_WIN out; runtime loop bounds keep one shared loop body instead
+  // of two unrolled copies of the gather.
+  const wF = int(1).toVar();
+  If(mi.y.greaterThan(float(1.5)), () => { wF.assign(int(GIANT_WIN)); });
+  const wFf = float(wF).toVar();
+  const cx = int(clamp(p.x.div(u.cell), wFf, u.gridWf.sub(wFf).sub(1))).toVar();
+  const cy = int(clamp(p.y.div(u.cell), wFf, u.gridHf.sub(wFf).sub(1))).toVar();
+
+  Loop({ start: cy.sub(wF), end: cy.add(wF), type: 'int', condition: '<=', name: 'gy' }, ({ gy }) => {
+    Loop({ start: cx.sub(wF), end: cx.add(wF), type: 'int', condition: '<=', name: 'gx' }, ({ gx }) => {
+      const cell = gy.mul(u.gridW).add(gx).toVar();
       for (let k = 0; k < BUCKET_K; k++) {
         const raw = bucket.element(cell.mul(int(BUCKET_K)).add(int(k))).toVar();
         If(raw.greaterThan(uint(0)), () => {
-          const other = raw.sub(uint(1)).toVar();
-          If(other.notEqual(i), () => {
-            const q = pos.element(other).xy.toVar();
-            const delta = p.sub(q).toVar();
-            const dist = length(delta).toVar();
-            If(dist.lessThan(minDist), () => {
-              // Coincident pairs give a garbage normal. Fall back to a stable
-              // per-pair direction rather than to noise, so the pair actually
-              // separates instead of jittering in place.
-              const degenerate = step(dist, float(1e-5));
-              const ang = hash(i.add(other).add(uint(7331))).mul(6.2831853).toVar();
-              const jitter = vec2(cos(ang), sin(ang));
-              const n = mix(delta.div(max(dist, float(1e-5))), jitter, degenerate).toVar();
-              const overlap = minDist.sub(dist).toVar();
-              // Split the overlap by inverse mass instead of evenly. Equal
-              // masses give half each, exactly as before; a heavy particle
-              // yields less and so shoves lighter ones aside.
-              //
-              // This is the only mass term in the file, and buoyancy falls out
-              // of it: there is no buoyancy force anywhere, the dense phase
-              // simply wins its contacts and sinks.
-              const wj = meta.element(other).x.toVar();
-              const share = wi.div(max(wi.add(wj), float(1e-5))).toVar();
-              push.addAssign(n.mul(overlap.mul(share)));
-              hits.addAssign(1);
-              deepest.assign(max(deepest, overlap));
-            });
-          });
+          visit(raw.sub(uint(1)).toVar());
+        });
+      }
+    });
+  });
+
+  // COARSE GRID, 3x3 for everyone: one coarse cell is already wider than any
+  // giant-anything contact distance, so this window always covers it.
+  const gx0 = int(clamp(p.x.div(u.ccell), float(1), u.cgridWf.sub(2))).toVar();
+  const gy0 = int(clamp(p.y.div(u.ccell), float(1), u.cgridHf.sub(2))).toVar();
+  for (let oy = -1; oy <= 1; oy++) {
+    for (let ox = -1; ox <= 1; ox++) {
+      const cell = gy0.add(int(oy)).mul(u.cgridW).add(gx0.add(int(ox))).toVar();
+      for (let k = 0; k < CBUCKET_K; k++) {
+        const raw = cbucket.element(cell.mul(int(CBUCKET_K)).add(int(k))).toVar();
+        If(raw.greaterThan(uint(0)), () => {
+          visit(raw.sub(uint(1)).toVar());
         });
       }
     }
@@ -387,10 +546,11 @@ const relaxPass = Fn(() => {
 // ---------------------------------------------------------------- apply pass
 const applyPass = Fn(() => {
   const i = instanceIndex;
-  If(meta.element(i).z.greaterThan(u.time), () => { Return(); });
+  const mi = meta.element(i).toVar();
+  If(mi.z.greaterThan(u.time), () => { Return(); });
   const P = pos.element(i).toVar();
   const p = P.xy.add(corr.element(i).xy.mul(u.stiffness)).toVar();
-  const r = u.radius.toVar();
+  const r = mi.w.mul(u.rScale).toVar();
 
   // Static obstacles, projected out the same way the walls are: an immovable
   // body is just a contact with zero inverse mass, so the particle takes the
@@ -409,6 +569,40 @@ const applyPass = Fn(() => {
     }
   });
 
+  // Solid rectangles, same contract as the pegs: an immovable body, so the
+  // particle takes the whole correction. Two regimes. A centre still outside
+  // the rectangle is pushed away from its closest point on the surface, which
+  // rounds the corners correctly (the Minkowski sum of a box and a disc has
+  // round corners; pushing on the nearest axis instead snags balls rolling off
+  // an edge). A centre INSIDE the rectangle has no meaningful closest-point
+  // normal, so it exits through the nearest face.
+  for (let k = 0; k < MAX_BOXES; k++) {
+    If(int(k).lessThan(u.boxCount), () => {
+      const b = boxes.element(uint(k)).toVar();
+      const d = p.sub(b.xy).toVar();
+      If(abs(d.x).lessThan(b.z.add(r)).and(abs(d.y).lessThan(b.w.add(r))), () => {
+        If(abs(d.x).greaterThan(b.z).or(abs(d.y).greaterThan(b.w)), () => {
+          const cpt = vec2(clamp(d.x, b.z.negate(), b.z), clamp(d.y, b.w.negate(), b.w)).toVar();
+          const away = d.sub(cpt).toVar();
+          const dist = max(length(away), float(1e-5)).toVar();
+          If(dist.lessThan(r), () => {
+            p.assign(b.xy.add(cpt).add(away.div(dist).mul(r)));
+          });
+        }).Else(() => {
+          const sx = mix(float(-1), float(1), step(float(0), d.x)).toVar();
+          const sy = mix(float(-1), float(1), step(float(0), d.y)).toVar();
+          const px = b.z.sub(abs(d.x)).toVar();       // depth to each face
+          const py = b.w.sub(abs(d.y)).toVar();
+          If(px.lessThan(py), () => {
+            p.assign(vec2(b.x.add(sx.mul(b.z.add(r))), p.y));
+          }).Else(() => {
+            p.assign(vec2(p.x, b.y.add(sy.mul(b.w.add(r)))));
+          });
+        });
+      });
+    });
+  }
+
   // Walls are a hard constraint, resolved last so nothing ever ends a step
   // outside the box.
   pos.element(i).assign(vec4(
@@ -424,38 +618,44 @@ const applyPass = Fn(() => {
 // damping term, no friction hack and no special case for "resting".
 const finishPass = Fn(() => {
   const i = instanceIndex;
-  If(meta.element(i).z.greaterThan(u.time), () => { Return(); });
+  const mi = meta.element(i).toVar();
+  If(mi.z.greaterThan(u.time), () => { Return(); });
   const p = pos.element(i).xy.toVar();
   const v = p.sub(prev.element(i)).div(u.h).toVar();
 
   // XSPH viscosity: nudge toward the neighbourhood average. This is the whole
   // difference between marbles and water. It is velocity SMOOTHING, not velocity
   // assignment, so it cannot overrule a contact.
-  const sum = vec2(0).toVar();
-  const n = float(0).toVar();
-  const rad = u.radius.mul(2.4).toVar();
-  const cx = int(clamp(p.x.div(u.cell), float(1), u.gridWf.sub(2))).toVar();
-  const cy = int(clamp(p.y.div(u.cell), float(1), u.gridHf.sub(2))).toVar();
-  for (let oy = -1; oy <= 1; oy++) {
-    for (let ox = -1; ox <= 1; ox++) {
-      const cell = cy.add(int(oy)).mul(u.gridW).add(cx.add(int(ox))).toVar();
-      for (let k = 0; k < BUCKET_K; k++) {
-        const raw = bucket.element(cell.mul(int(BUCKET_K)).add(int(k))).toVar();
-        If(raw.greaterThan(uint(0)), () => {
-          const other = raw.sub(uint(1)).toVar();
-          If(other.notEqual(i), () => {
-            const Q = pos.element(other).toVar();
-            If(length(p.sub(Q.xy)).lessThan(rad), () => {
-              sum.addAssign(Q.zw);
-              n.addAssign(1);
+  //
+  // Crowd only. Giants are boulders, not water, and their crowd neighbours live
+  // in the other grid anyway, so a giant would smooth against nobody.
+  If(mi.y.lessThan(float(1.5)), () => {
+    const sum = vec2(0).toVar();
+    const n = float(0).toVar();
+    const rad = mi.w.mul(u.rScale).mul(2.4).toVar();
+    const cx = int(clamp(p.x.div(u.cell), float(1), u.gridWf.sub(2))).toVar();
+    const cy = int(clamp(p.y.div(u.cell), float(1), u.gridHf.sub(2))).toVar();
+    for (let oy = -1; oy <= 1; oy++) {
+      for (let ox = -1; ox <= 1; ox++) {
+        const cell = cy.add(int(oy)).mul(u.gridW).add(cx.add(int(ox))).toVar();
+        for (let k = 0; k < BUCKET_K; k++) {
+          const raw = bucket.element(cell.mul(int(BUCKET_K)).add(int(k))).toVar();
+          If(raw.greaterThan(uint(0)), () => {
+            const other = raw.sub(uint(1)).toVar();
+            If(other.notEqual(i), () => {
+              const Q = pos.element(other).toVar();
+              If(length(p.sub(Q.xy)).lessThan(rad), () => {
+                sum.addAssign(Q.zw);
+                n.addAssign(1);
+              });
             });
           });
-        });
+        }
       }
     }
-  }
-  If(n.greaterThan(float(0)), () => {
-    v.addAssign(sum.div(n).sub(v).mul(u.viscosity));
+    If(n.greaterThan(float(0)), () => {
+      v.addAssign(sum.div(n).sub(v).mul(u.viscosity));
+    });
   });
 
   pos.element(i).assign(vec4(p, v));
@@ -476,16 +676,19 @@ const mat = new THREE.MeshBasicNodeMaterial();
 // An unspawned particle collapses to zero area rather than being drawn at the
 // spout, where twenty thousand of them would sit in a single bright dot.
 const awake = step(metaA.z, u.time);
-mat.positionNode = vec3(posA.xy.add(positionGeometry.xy.mul(u.radius.mul(2.35).mul(awake))), 0.1);
+mat.positionNode = vec3(posA.xy.add(positionGeometry.xy.mul(metaA.w.mul(u.rScale).mul(2.35).mul(awake))), 0.1);
 
 // Colour by speed, because speed is the thing under test. A healthy fluid shows
-// a moving front and a still body; a broken one is uniformly one colour. The
-// dense phase gets its own hue so the separation is readable at a glance.
+// a moving front and a still body; a broken one is uniformly one colour. Each
+// size class gets its own hue so the tiers are readable at a glance: smalls
+// blue, larges ember, giants magenta.
 const speed = length(posA.zw);
 const t = clamp(speed.div(18), 0, 1);
-const light = mix(vec3(0.11, 0.35, 0.72), vec3(0.34, 0.83, 1.0), smoothstep(0, 0.45, t));
-const dense = mix(vec3(0.55, 0.20, 0.10), vec3(1.0, 0.62, 0.24), smoothstep(0, 0.45, t));
-const tint = mix(light, dense, metaA.y)
+const glow = smoothstep(0, 0.45, t);
+const smallC = mix(vec3(0.11, 0.35, 0.72), vec3(0.34, 0.83, 1.0), glow);
+const largeC = mix(vec3(0.55, 0.20, 0.10), vec3(1.0, 0.62, 0.24), glow);
+const giantC = mix(vec3(0.45, 0.10, 0.40), vec3(1.0, 0.36, 0.88), glow);
+const tint = mix(mix(smallC, largeC, clamp(metaA.y, 0, 1)), giantC, clamp(metaA.y.sub(1), 0, 1))
   .add(vec3(0.94, 0.99, 1.0).mul(smoothstep(0.55, 1, t).mul(0.7)));
 
 // Soft round sprite. The rim highlight is what stops a dense pack from reading
@@ -520,6 +723,26 @@ pegMat.depthWrite = false;
 const pegMesh = new THREE.Mesh(pegGeo, pegMat);
 pegMesh.frustumCulled = false;
 scene.add(pegMesh);
+
+// Rectangles, also drawn from the buffer the solver collides against. An unused
+// slot has zero extents and collapses to a degenerate quad, so there is no
+// per-instance visibility to manage.
+const boxGeo = new THREE.InstancedBufferGeometry();
+boxGeo.setAttribute('position', src.getAttribute('position'));
+boxGeo.setAttribute('uv', src.getAttribute('uv'));
+boxGeo.setIndex(src.getIndex());
+boxGeo.instanceCount = MAX_BOXES;
+
+const boxA = boxes.toAttribute();
+const boxMat = new THREE.MeshBasicNodeMaterial();
+boxMat.positionNode = vec3(boxA.xy.add(positionGeometry.xy.mul(boxA.zw.mul(2))), 0.05);
+const bEdge = abs(uv().sub(0.5)).mul(2);
+boxMat.colorNode = mix(vec3(0.13, 0.18, 0.25), vec3(0.30, 0.44, 0.58),
+  smoothstep(0.88, 1.0, max(bEdge.x, bEdge.y)));
+
+const boxMesh = new THREE.Mesh(boxGeo, boxMat);
+boxMesh.frustumCulled = false;
+scene.add(boxMesh);
 
 // Pointer ring, so the tool has a visible size rather than an invisible one.
 const ringPts = [];
@@ -556,7 +779,7 @@ const $ = (id) => document.getElementById(id);
 // Doubling substeps beat quadrupling iterations every time, because iterations
 // only polish what the substep already saw: they cannot recover a contact that
 // the particle stepped straight over.
-const state = { mode: 0, substeps: 16, iterations: 4, radius: AUTO_R, paused: false };
+const state = { mode: 0, substeps: 16, iterations: 4, radius: BASE_R, giants: GIANTS0, paused: false };
 
 function bindSlider(id, get, set, fmt = (v) => v.toFixed(2)) {
   const s = $(`s-${id}`);
@@ -571,23 +794,69 @@ function bindSlider(id, get, set, fmt = (v) => v.toFixed(2)) {
 
 function setRadius(r) {
   state.radius = r;
-  u.radius.value = r;
-  // Cell size follows the radius so the 3x3 neighbourhood always covers the
-  // contact distance. Get this wrong in either direction and you either miss
-  // neighbours entirely or pay to visit hundreds of them.
-  const cell = Math.max(CELL_MIN, r * 2.05);
+  // The slider is a global scale on every per-particle base radius; r is the
+  // crowd's base (what the label shows), and the classes ride along. The
+  // sqrt(area) compensation holds the fill steady when the giant slider moves:
+  // more giants, smaller everyone, same total coverage.
+  const s = (r / BASE_R) * Math.sqrt(AREA_MULT0 / areaMult(state.giants));
+  u.rScale.value = s;
+  // Cell size follows the radius so each neighbourhood window always covers
+  // the contact distance. Get this wrong in either direction and you either
+  // miss neighbours entirely or pay to visit hundreds of them.
+  const cell = Math.max(CELL_MIN, M_LARGE * BASE_R * s * 2.05);
   u.cell.value = cell;
   u.gridW.value = Math.min(GRID_W_MAX, Math.ceil(WORLD_W / cell) + 1);
   u.gridWf.value = u.gridW.value;
   u.gridHf.value = Math.min(GRID_H_MAX, Math.ceil(WORLD_H / cell) + 1);
-  $('fill').textContent = `${((COUNT * Math.PI * r * r) / (WORLD_W * WORLD_H) * 100).toFixed(0)} %`;
+  const ccell = Math.max(CCELL_MIN, M_GIANT * BASE_R * s * 2.05);
+  u.ccell.value = ccell;
+  u.cgridW.value = Math.min(CGRID_W_MAX, Math.ceil(WORLD_W / ccell) + 1);
+  u.cgridWf.value = u.cgridW.value;
+  u.cgridHf.value = Math.min(CGRID_H_MAX, Math.ceil(WORLD_H / ccell) + 1);
+  $('fill').textContent = `${((Math.PI * areaMult(state.giants) * (BASE_R * s) ** 2) / (WORLD_W * WORLD_H) * 100).toFixed(0)} %`;
 }
+
+function setGiants(n) {
+  state.giants = Math.max(0, Math.min(GIANTS_MAX, Math.round(n)));
+  u.crowdN.value = COUNT - state.giants;
+  u.smallN.value = Math.round((COUNT - state.giants) * 0.65);
+  $('count').textContent = state.giants
+    ? `${COUNT.toLocaleString()} (${state.giants} giants)`
+    : COUNT.toLocaleString();
+  setRadius(state.radius);     // re-derive the fill compensation and both grids
+  reset();                     // classes are baked at init, so the pit restarts
+}
+
+// Rectangles the balls cannot enter. Takes [cx, cy, width, height] per box,
+// stored as half extents. Kept on the CPU too so the probe can count breaches
+// without a GPU readback.
+let activeBoxes = [];
+function setBoxes(list) {
+  activeBoxes = list.slice(0, MAX_BOXES).map(([x, y, w, h]) => [x, y, w / 2, h / 2]);
+  for (let k = 0; k < MAX_BOXES; k++) {
+    const [x, y, hw, hh] = activeBoxes[k] ?? [0, 0, 0, 0];
+    boxSrc.array[k].set(x, y, hw, hh);
+  }
+  u.boxCount.value = activeBoxes.length;
+  renderer.compute(boxUploadPass);
+}
+
+// The MAP layout: two shelves and a pillar. Chosen so a dropped slab has to do
+// everything at once: pile up on a ledge, cascade off its edge onto a lower
+// one, and part around a standing obstacle.
+const MAP_BOXES = [
+  [8, 15, 12, 1],       // upper shelf, left
+  [30, 10, 12, 1],      // lower shelf, right
+  [20, 3.5, 4, 7],      // pillar standing on the floor
+];
 
 $('s-radius').min = R_MIN.toFixed(4);
 $('s-radius').max = R_MAX.toFixed(4);
 $('s-radius').step = ((R_MAX - R_MIN) / 40).toFixed(5);
 
 bindSlider('radius', () => state.radius, setRadius, (v) => v.toFixed(3));
+$('s-giants').max = String(GIANTS_MAX);
+bindSlider('giants', () => state.giants, setGiants, (v) => v.toFixed(0));
 bindSlider('stiff', () => u.stiffness.value, (v) => { u.stiffness.value = v; });
 bindSlider('visc', () => u.viscosity.value, (v) => { u.viscosity.value = v; });
 bindSlider('subs', () => state.substeps, (v) => { state.substeps = v; }, (v) => v.toFixed(0));
@@ -595,8 +864,10 @@ bindSlider('iters', () => state.iterations, (v) => { state.iterations = v; }, (v
 bindSlider('grav', () => u.gravity.value, (v) => { u.gravity.value = v; }, (v) => v.toFixed(0));
 bindSlider('flow', () => u.flow.value, (v) => { u.flow.value = v; }, (v) => v.toFixed(0));
 
-setRadius(AUTO_R);
-$('count').textContent = COUNT.toLocaleString();
+setRadius(BASE_R);
+$('count').textContent = state.giants
+  ? `${COUNT.toLocaleString()} (${state.giants} giants)`
+  : COUNT.toLocaleString();
 
 let frames = 0;
 
@@ -614,6 +885,9 @@ function setMode(m) {
   state.mode = ((m % MODES.length) + MODES.length) % MODES.length;
   u.mode.value = state.mode;
   u.pegsOn.value = state.mode === 4 ? 1 : 0;
+  // MAP carries its default layout; every other mode starts with a clear field.
+  // Boxes set through __ballpitSet after this survive resets but not mode changes.
+  setBoxes(state.mode === 6 ? MAP_BOXES : []);
   $('modeBtn').textContent = `MODE: ${MODES[state.mode]} (space)`;
   reset();
 }
@@ -692,6 +966,8 @@ resize();
 let last = performance.now();
 let fpsAcc = 0;
 let fpsN = 0;
+const frameList = [];
+let frameListKey = 0;
 let computeMs = 0;
 let compression = 0;
 let cappedPct = 0;
@@ -731,17 +1007,30 @@ renderer.setAnimationLoop(() => {
     const K = Math.max(1, Math.round(state.iterations));
     u.h.value = dt / S;
     u.time.value += dt;
-    for (let s = 0; s < S; s++) {
-      // clear first: predict writes the speed-limit tally into the same stats
-      // block, and clearing after it would wipe the number every substep.
-      renderer.compute(clearPass);
-      renderer.compute(predictPass);
-      renderer.compute(scatterPass);
-      for (let k = 0; k < K; k++) {
-        renderer.compute(relaxPass);
-        renderer.compute(applyPass);
+    // The WHOLE frame goes to the GPU as ONE renderer.compute() call. Each
+    // call is a command-encoder round trip, and at 16 substeps x 4 iterations
+    // that used to be 192 of them per frame; the encode overhead dwarfed the
+    // actual compute (measured ~20 ms of a 29 ms frame at 50k heads). WebGPU
+    // guarantees writes from one dispatch are visible to the next inside a
+    // pass, so batching changes nothing about the maths.
+    //
+    // clear stays first within each substep: predict writes the speed-limit
+    // tally into the same stats block, and clearing after it would wipe the
+    // number every substep.
+    const key = S * 100 + K;
+    if (key !== frameListKey) {
+      frameListKey = key;
+      frameList.length = 0;
+      for (let s = 0; s < S; s++) {
+        frameList.push(clearPass, predictPass, scatterPass);
+        for (let k = 0; k < K; k++) frameList.push(relaxPass, applyPass);
+        frameList.push(finishPass);
       }
-      renderer.compute(finishPass);
+    }
+    if (qs.has('nobatch')) {
+      for (const pass of frameList) renderer.compute(pass);
+    } else {
+      renderer.compute(frameList);
     }
   }
 
@@ -773,9 +1062,11 @@ renderer.setAnimationLoop(() => {
 globalThis.__ballpit = () => ({
   frames,
   count: COUNT,
+  giants: state.giants,
   mode: MODES[state.mode],
+  boxes: activeBoxes.length,
   radius: Number(state.radius.toFixed(4)),
-  fillPct: Number(((COUNT * Math.PI * state.radius ** 2) / (WORLD_W * WORLD_H) * 100).toFixed(1)),
+  fillPct: Number(((Math.PI * areaMult(state.giants) * (BASE_R * u.rScale.value) ** 2) / (WORLD_W * WORLD_H) * 100).toFixed(1)),
   compressionPct: Number((compression * 100).toFixed(2)),
   cappedPct: Number(cappedPct.toFixed(1)),
   droppedPct: Number(droppedPct.toFixed(2)),
@@ -790,10 +1081,12 @@ globalThis.__ballpitProbe = async () => {
   const buf = await renderer.getArrayBufferAsync(pos.value);
   const f = new Float32Array(buf);
   const m = new Float32Array(await renderer.getArrayBufferAsync(meta.value));
+  const scale = u.rScale.value;
+  const rOf = (i) => m[i * 4 + 3] * scale;             // effective radius
   let maxY = 0; let maxX = 0; let sumY = 0; let sumSpeed = 0; let moving = 0;
   let awake = 0;
-  let denseY = 0; let denseX = 0; let denseS = 0; let denseN = 0;
-  let lightY = 0; let lightX = 0; let lightS = 0; let lightN = 0;
+  // one accumulator per class: small, large, giant
+  const acc = [0, 1, 2].map(() => ({ n: 0, y: 0, x: 0, s: 0 }));
   const cols = 24;
   const height = new Array(cols).fill(0);
   for (let i = 0; i < COUNT; i++) {
@@ -807,7 +1100,8 @@ globalThis.__ballpitProbe = async () => {
     sumY += y;
     sumSpeed += sp;
     if (sp > 0.4) moving++;
-    if (m[i * 4 + 1] > 0.5) { denseY += y; denseX += x; denseS += sp; denseN++; } else { lightY += y; lightX += x; lightS += sp; lightN++; }
+    const c0 = acc[Math.min(2, Math.round(m[i * 4 + 1]))];
+    c0.n++; c0.y += y; c0.x += x; c0.s += sp;
     const c = Math.min(cols - 1, Math.max(0, Math.floor((x / WORLD_W) * cols)));
     if (y > height[c]) height[c] = y;
   }
@@ -822,14 +1116,70 @@ globalThis.__ballpitProbe = async () => {
         const dx = f[i * 4] - g[k * 4];
         const dy = f[i * 4 + 1] - g[k * 4 + 1];
         // a hair of tolerance: sitting exactly on the surface is a contact, not a breach
-        if (Math.hypot(dx, dy) < g[k * 4 + 2] - state.radius * 0.25) { pegOverlaps++; break; }
+        if (Math.hypot(dx, dy) < g[k * 4 + 2] - rOf(i) * 0.25) { pegOverlaps++; break; }
+      }
+    }
+  }
+
+  // Same silent-tunnelling check for the rectangles. A centre inside the core
+  // rectangle is a full radius past where the solver should have stopped it.
+  let boxOverlaps = 0;
+  if (activeBoxes.length) {
+    for (let i = 0; i < COUNT; i++) {
+      if (m[i * 4 + 2] > u.time.value) continue;
+      const tol = rOf(i) * 0.25;
+      for (const [bx, by, hw, hh] of activeBoxes) {
+        if (Math.abs(f[i * 4] - bx) < hw - tol && Math.abs(f[i * 4 + 1] - by) < hh - tol) {
+          boxOverlaps++;
+          break;
+        }
+      }
+    }
+  }
+
+  // Cross-tier tunnelling. A crowd centre swallowed inside a giant's disc means
+  // the two-grid pair discovery missed a contact; the render would never show
+  // it. Same for a giant pair 25% into each other.
+  const crowdN = COUNT - state.giants;
+  const giantList = [];
+  for (let i = crowdN; i < COUNT; i++) {
+    if (m[i * 4 + 2] > u.time.value) continue;
+    giantList.push([f[i * 4], f[i * 4 + 1], rOf(i)]);
+  }
+  let giantCrowdBreaches = 0;
+  let giantGiantBreaches = 0;
+  if (giantList.length) {
+    for (let i = 0; i < crowdN; i++) {
+      if (m[i * 4 + 2] > u.time.value) continue;
+      const tol = rOf(i) * 0.25;
+      for (const [gx, gy, gr] of giantList) {
+        if (Math.hypot(f[i * 4] - gx, f[i * 4 + 1] - gy) < gr - tol) {
+          giantCrowdBreaches++;
+          break;
+        }
+      }
+    }
+    for (let a = 0; a < giantList.length; a++) {
+      for (let b = a + 1; b < giantList.length; b++) {
+        const d = Math.hypot(giantList[a][0] - giantList[b][0], giantList[a][1] - giantList[b][1]);
+        if (d < (giantList[a][2] + giantList[b][2]) * 0.75) giantGiantBreaches++;
       }
     }
   }
 
   const n = Math.max(1, awake);
+  const cls = (c) => ({
+    n: c.n,
+    pct: +((c.n / n) * 100).toFixed(1),
+    meanY: c.n ? +(c.y / c.n).toFixed(2) : null,
+    meanX: c.n ? +(c.x / c.n).toFixed(2) : null,
+    meanSpeed: c.n ? +(c.s / c.n).toFixed(3) : null,
+  });
   return {
     pegOverlaps,
+    boxOverlaps,
+    giantCrowdBreaches,
+    giantGiantBreaches,
     worldW: WORLD_W,
     worldH: WORLD_H,
     radius: +state.radius.toFixed(4),
@@ -840,15 +1190,13 @@ globalThis.__ballpitProbe = async () => {
     meanY: +(sumY / n).toFixed(2),
     meanSpeed: +(sumSpeed / n).toFixed(2),
     movingPct: +((moving / n) * 100).toFixed(1),
-    // Mean height of each phase. If mass handling is right, the dense one is
-    // measurably lower than the light one.
-    denseMeanY: denseN ? +(denseY / denseN).toFixed(2) : null,
-    lightMeanY: lightN ? +(lightY / lightN).toFixed(2) : null,
-    denseMeanX: denseN ? +(denseX / denseN).toFixed(2) : null,
-    lightMeanX: lightN ? +(lightX / lightN).toFixed(2) : null,
-    densePct: +((denseN / n) * 100).toFixed(1),
-    denseMeanSpeed: denseN ? +(denseS / denseN).toFixed(3) : null,
-    lightMeanSpeed: lightN ? +(lightS / lightN).toFixed(3) : null,
+    // Per-class means. If mass handling is right, the heavier classes are
+    // measurably affected by their contacts; SHOVE judges the direction.
+    classes: {
+      small: cls(acc[0]),
+      large: cls(acc[1]),
+      giant: cls(acc[2]),
+    },
     profile: height.map((h) => +h.toFixed(2)),
   };
 };
@@ -871,6 +1219,8 @@ globalThis.__ballpitDrift = async (ms = 1200) => {
 globalThis.__ballpitSet = (k, v) => {
   if (k === 'mode') { setMode(v); return true; }
   if (k === 'radius') { setRadius(v); return true; }
+  if (k === 'giants') { setGiants(v); return true; }
+  if (k === 'boxes') { setBoxes(v); return true; }
   if (k in u) { u[k].value = v; return true; }
   if (k in state) { state[k] = v; return true; }
   return false;

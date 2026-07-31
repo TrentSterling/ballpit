@@ -35,6 +35,11 @@ const child = spawn(CHROME, [
   '--no-first-run', '--no-default-browser-check',
   '--enable-unsafe-webgpu',
   '--window-size=1600,900',
+  // Offscreen, deliberately. The judged run cannot share a mouse with a human:
+  // a slider drag mid-measurement re-inits the pit and the probe faithfully
+  // fails physics that was never given a chance to settle. (Field report: a
+  // visible probe window WILL be played with.)
+  '--window-position=-32000,-32000',
   // Without these, Chrome treats the window as occluded the moment anything
   // covers it and stops requestAnimationFrame entirely: zero frames, no error.
   '--disable-features=CalculateNativeWinOcclusion',
@@ -159,9 +164,19 @@ const CHECKS = {
     name: 'SWIRL',
     // Under a rotating body force the whole mass must stay in motion. If it
     // stalls, contacts are eating the drive.
+    //
+    // The Brazil-nut assert lives HERE, not in SHOVE, because size segregation
+    // needs sustained agitation: every jiggle opens voids under a giant that
+    // only small balls can backfill, so the big bodies ride up despite 17x the
+    // mass. SHOVE freezes into a static wedge and the effect freezes with it
+    // (measured: giant-vs-small mean height lands within noise there). The
+    // churn never stops in SWIRL, so the direction is stable: +0.2 to +0.9
+    // across runs with a 300-giant sample.
+    giants: 300,
     test: (p) => [
       [p.movingPct > 70, `${p.movingPct}% in motion (want >70%)`],
       [p.meanSpeed > 2, `mean speed ${p.meanSpeed} (want >2)`],
+      [p.classes.giant.meanY > p.classes.small.meanY, `giants ride the churn, Brazil-nut style (y ${p.classes.giant.meanY} vs small ${p.classes.small.meanY})`],
     ],
   },
   4: {
@@ -178,23 +193,53 @@ const CHECKS = {
   },
   5: {
     name: 'SHOVE',
-    // A mixed crowd driven sideways: one particle in four is five times as
-    // heavy. If the inverse-mass split in the contact solve works, the heavy
-    // minority ploughs to the front and holds it. This is the crowd-game
-    // property — brutes reaching the objective ahead of runners — and it is the
-    // only thing mass actually buys in a non-penetration solver.
-    // NOTE the direction. The heavy phase TRAILS and sits LOWER, which is the
-    // opposite of the obvious guess. At a free surface the phase that takes the
-    // larger share of every correction is the one that gets squirted up and
-    // over the top, so the LIGHT particles surf forward while the heavy ones
-    // stay in the packed body. Mass buys you resistance to displacement, not a
-    // battering ram.
+    // A mixed crowd driven sideways into a packed wedge against the far wall.
+    //
+    // What this mode asserts CHANGED when mass got tied to area. The old test
+    // gave a same-size quarter 5x mass and watched it trail and sink; the
+    // size classes replaced that knob, and measurement was blunt about what
+    // survived: the crowd's 2x contrast is below the noise floor, and even the
+    // giants' 17x lands within noise once the wedge freezes, because
+    // segregation needs agitation (see SWIRL, where it is asserted). What
+    // SHOVE still proves is that a mixed-size crowd banks up honestly and the
+    // cross-tier guarantees hold under sustained lateral crush; per-class
+    // means stay in the report for eyeballing.
     seconds: 12,
-    test: (p) => [
-      [p.densePct > 15 && p.densePct < 40, `mixed crowd: ${p.densePct}% heavy`],
-      [p.denseMeanY < p.lightMeanY, `heavy phase rides lower (y ${p.denseMeanY} vs ${p.lightMeanY})`],
-      [p.lightMeanX - p.denseMeanX > p.worldW * 0.01, `light phase surfs ahead by ${(p.lightMeanX - p.denseMeanX).toFixed(2)} (want > ${(p.worldW * 0.01).toFixed(2)}: mass is affecting the solve)`],
-    ],
+    giants: 300,
+    test: (p) => {
+      const left = avg(p.profile.slice(0, 6));
+      const right = avg(p.profile.slice(-6));
+      return [
+        [p.classes.large.pct > 20 && p.classes.large.pct < 45, `mixed crowd: ${p.classes.large.pct}% large`],
+        [p.classes.giant.pct > 1, `giant sample present: ${p.classes.giant.pct}%`],
+        [right > left, `crowd banked downstream (${left.toFixed(1)} -> ${right.toFixed(1)}); class means small/large/giant y = ${p.classes.small.meanY}/${p.classes.large.meanY}/${p.classes.giant.meanY}`],
+      ];
+    },
+  },
+  6: {
+    name: 'MAP',
+    // A slab dropped onto solid rectangles: two shelves and a pillar. The hard
+    // promise is non-penetration; the shape checks confirm the shelves actually
+    // CARRY the pile instead of letting it slip through to the floor.
+    //
+    // The rest bound is deliberately looser than FALL's. These balls have no
+    // friction, so a pile on a shelf drains off the free edge in a slow trickle
+    // that is still measurable at 20 s (drift plateaus near 0.1 while the body
+    // sits stone still). Demanding FALL-grade stillness condemns physics that
+    // is behaving; what this bound condemns is surface jitter or bulk flow,
+    // which read as drift of a unit or more.
+    seconds: 12,
+    settle: true,
+    test: (p) => {
+      const upper = Math.max(...p.profile.slice(2, 8));     // over shelf top 15.5
+      const lower = Math.max(...p.profile.slice(15, 21));   // over shelf top 10.5
+      return [
+        [p.boxOverlaps === 0, `${p.boxOverlaps} particles inside a rectangle (want 0)`],
+        [upper > 15, `upper shelf carries a pile (peak ${upper.toFixed(1)}, shelf top 15.5)`],
+        [lower > 10, `lower shelf carries a pile (peak ${lower.toFixed(1)}, shelf top 10.5)`],
+        [p.drift < p.radius * 4, `body at rest, edge trickle allowed: mean drift ${p.drift.toFixed(4)} over 1.2s (want < ${(p.radius * 4).toFixed(4)})`],
+      ];
+    },
   },
 };
 
@@ -208,6 +253,9 @@ function sparkline(profile, worldH) {
 let failed = 0;
 for (const key of Object.keys(CHECKS)) {
   const mode = Number(key);
+  // Giant count per mode (default 12), set BEFORE the mode so the mode change
+  // does the final reset.
+  await evalJS(`__ballpitSet('giants', ${CHECKS[mode].giants ?? 12})`);
   await evalJS(`__ballpitSet('mode', ${mode})`);
   await sleep((CHECKS[mode].seconds ?? SECONDS) * 1000);
 
@@ -216,9 +264,12 @@ for (const key of Object.keys(CHECKS)) {
   if (CHECKS[mode].settle) p.drift = await evalJS('__ballpitDrift(1200)');
 
   console.log(`\n=== ${CHECKS[mode].name} ===`);
-  console.log(`  ${h.count.toLocaleString()} particles  r=${h.radius}  fill=${h.fillPct}%  ${h.substeps}x${h.iterations} steps  compute=${h.computeMs}ms`);
+  console.log(`  ${h.count.toLocaleString()} particles (${h.giants} giants)  r=${h.radius}  fill=${h.fillPct}%  ${h.substeps}x${h.iterations} steps  compute=${h.computeMs}ms`);
   console.log(`  overlap=${h.compressionPct}%  speed-capped=${h.cappedPct}%  hash-dropped=${h.droppedPct}%`);
   console.log(`  surface |${sparkline(p.profile, p.worldH)}|  maxY=${p.maxY} maxX=${p.maxX} moving=${p.movingPct}%`);
+  if (p.classes.giant.n) {
+    console.log(`  classes  small y=${p.classes.small.meanY}  large y=${p.classes.large.meanY}  giant y=${p.classes.giant.meanY} (${p.classes.giant.n} awake)`);
+  }
 
   for (const [ok, msg] of CHECKS[mode].test(p)) {
     console.log(`  ${ok ? 'PASS' : 'FAIL'}  ${msg}`);
@@ -227,6 +278,18 @@ for (const key of Object.keys(CHECKS)) {
   if (h.compressionPct > 12) {
     console.log(`  FAIL  overlap ${h.compressionPct}% of a diameter: the solver is not converging`);
     failed++;
+  }
+  // Cross-tier non-penetration holds in EVERY mode: the two-grid pair
+  // discovery is only correct if no crowd centre ever ends up inside a giant
+  // and no giant pair sits deeply merged.
+  if (p.classes.giant.n) {
+    for (const [ok, msg] of [
+      [p.giantCrowdBreaches === 0, `${p.giantCrowdBreaches} crowd centres inside a giant (want 0)`],
+      [p.giantGiantBreaches === 0, `${p.giantGiantBreaches} giant pairs deeply merged (want 0)`],
+    ]) {
+      console.log(`  ${ok ? 'PASS' : 'FAIL'}  ${msg}`);
+      if (!ok) failed++;
+    }
   }
 
   const shot = await call('Page.captureScreenshot', { format: 'png' });

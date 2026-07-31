@@ -23,12 +23,33 @@ fails visibly if the solver is wrong:
 | **SWIRL** | a rotating force keeps the whole mass in motion instead of jamming. |
 | **PEGS** | a timed pour through static obstacles. Tests the spawn schedule and obstacle collision at once. |
 | **SHOVE** | a mixed crowd of two masses, driven sideways. Tests that inverse mass reaches the contact solve. |
+| **MAP** | a slab dropped onto solid rectangles: two shelves and a pillar. Tests that balls pile up ON static boxes and never end up inside one. |
 
 ![pegs](shots/pegs.png)
 
 Left-drag pushes, right-drag pulls, the wheel resizes the tool. Pull is the more
 interesting one: a solver that cannot hold a void open collapses the instant you
 let go.
+
+## Map collision
+
+Solid rectangles the balls cannot enter, resolved like the pegs: an immovable
+body is a contact with zero inverse mass, so the ball takes the whole
+correction. Projected after the particle-particle pass and before the walls. A
+ball whose centre is outside the rectangle is pushed away from its closest point
+on the surface, which rounds the corners correctly; a centre that somehow ends
+up inside exits through the nearest face.
+
+MAP mode ships a default layout (two shelves and a pillar). Any layout can be
+set live, up to 16 boxes, each `[cx, cy, width, height]`:
+
+    __ballpitSet('boxes', [[20, 3.5, 4, 7], [8, 15, 12, 1]])
+
+Boxes survive R resets but are cleared on a mode change. The probe counts any
+ball whose centre ends a run inside a rectangle (`boxOverlaps`) and fails the
+run if it is not zero — tunnelling through a static body is silent otherwise.
+
+![map](shots/map.png)
 
 ## The rule
 

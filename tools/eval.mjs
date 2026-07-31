@@ -22,6 +22,9 @@ const child = spawn(CHROME, [
   `--user-data-dir=${join(process.env.TEMP ?? '.', 'ballpit-eval-profile')}`,
   '--no-first-run', '--no-default-browser-check', '--enable-unsafe-webgpu',
   '--window-size=1600,900',
+  // offscreen: same reason as probe.mjs, measurements cannot share a mouse.
+  // BALLPIT_VISIBLE=1 puts it back on screen for debugging the harness itself.
+  ...(process.env.BALLPIT_VISIBLE === '1' ? [] : ['--window-position=-32000,-32000']),
   '--disable-features=CalculateNativeWinOcclusion',
   '--disable-backgrounding-occluded-windows',
   '--disable-renderer-backgrounding',
