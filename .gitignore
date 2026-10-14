@@ -8,3 +8,5 @@ shots/*.png
 !shots/map.png
 node_modules/
 shots/archive/
+
+.about-evidence/
