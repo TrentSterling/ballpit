@@ -1035,6 +1035,8 @@ renderer.setAnimationLoop(() => {
   }
 
   renderer.render(scene, camera);
+  // resolve every frame so the timestamp query pool never overflows (it only reset on the 0.4 s stats tick before)
+  renderer.resolveTimestampsAsync(THREE.TimestampQuery.COMPUTE).catch(() => {});
   frames++;
 
   fpsAcc += dt;
@@ -1051,7 +1053,6 @@ renderer.setAnimationLoop(() => {
     $('dropped').style.color = droppedPct > 1 ? '#e2564a' : '';
     fpsAcc = 0;
     fpsN = 0;
-    renderer.resolveTimestampsAsync(THREE.TimestampQuery.COMPUTE).catch(() => {});
     computeMs = renderer.info.compute.timestamp ?? computeMs;
     pollStats();
   }
